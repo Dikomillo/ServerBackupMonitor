@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -26,6 +27,13 @@ XUI_PATHS = [
     "/etc/ssh/sshd_config.d",
 ]
 STACK_PATHS = ["/root/docker-compose.yml", "/root/.wg-easy", "/root/.nginx", "/opt/outline"]
+DEFAULT_SITE_ROOT = "/var/www/example.com"
+
+
+def site_paths(site_root):
+    if not re.fullmatch(r"/[A-Za-z0-9._/-]+", site_root) or site_root == "/" or ".." in site_root.split("/"):
+        raise ValueError("site_root must be a safe absolute Linux path")
+    return [site_root, "/etc/nginx"]
 VOLATILE_TABLES = {
     "client_global_traffics",
     "client_hwids",
@@ -134,13 +142,15 @@ def paths_fingerprint(paths):
     return h.hexdigest()
 
 
-def fingerprint(component):
+def fingerprint(component, site_root=DEFAULT_SITE_ROOT):
     h = hashlib.sha256()
     if component == "x-ui":
         h.update(db_fingerprint().encode())
         h.update(paths_fingerprint(XUI_PATHS).encode())
     elif component == "stack":
         h.update(paths_fingerprint(STACK_PATHS).encode())
+    elif component == "site":
+        h.update(paths_fingerprint(site_paths(site_root)).encode())
     else:
         raise ValueError(f"unknown component: {component}")
     return h.hexdigest()
@@ -182,10 +192,15 @@ def write_reports(report_dir, component):
             "x-ui-service.txt": ["systemctl", "status", "x-ui", "--no-pager", "-l"],
             "x-ui-version.txt": ["/usr/local/x-ui/x-ui", "version"],
         })
-    else:
+    elif component == "stack":
         commands.update({
             "docker-ps.txt": ["docker", "ps", "-a"],
             "docker-compose.txt": ["docker", "compose", "-f", "/root/docker-compose.yml", "config"],
+        })
+    else:
+        commands.update({
+            "nginx-service.txt": ["systemctl", "status", "nginx", "--no-pager", "-l"],
+            "nginx-config-test.txt": ["nginx", "-t"],
         })
     report_dir.mkdir(parents=True, exist_ok=True)
     for name, command in commands.items():
@@ -212,17 +227,17 @@ def snapshot_database(destination):
     return integrity
 
 
-def make_backup(component):
+def make_backup(component, site_root=DEFAULT_SITE_ROOT):
     stamp = utc_stamp()
     host = socket.gethostname().replace("/", "-")
-    current_fingerprint = fingerprint(component)
+    current_fingerprint = fingerprint(component, site_root)
     with tempfile.TemporaryDirectory(prefix=f"backup-{component}-", dir="/tmp") as temporary:
         root = Path(temporary) / f"{component}-backup-{host}-{stamp}"
         files = root / "files"
         reports = root / "reports"
         files.mkdir(parents=True)
         integrity = None
-        sources = XUI_PATHS if component == "x-ui" else STACK_PATHS
+        sources = XUI_PATHS if component == "x-ui" else STACK_PATHS if component == "stack" else site_paths(site_root)
         for source in sources:
             copy_source(source, files)
         if component == "x-ui":
@@ -251,10 +266,12 @@ def make_backup(component):
 
 def status():
     xui = run_report(["systemctl", "is-active", "x-ui"]).splitlines()
+    nginx = run_report(["systemctl", "is-active", "nginx"]).splitlines()
     docker = run_report(["docker", "ps", "-a", "--format", "{{.Names}}|{{.Status}}"]).splitlines()
     return {
         "hostname": socket.gethostname(),
         "x_ui": xui[-1].strip() if xui else "unknown",
+        "nginx": nginx[-1].strip() if nginx else "unknown",
         "containers": [line for line in docker if "|" in line],
     }
 
@@ -262,14 +279,15 @@ def status():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["manifest", "backup", "status"])
-    parser.add_argument("component", nargs="?", choices=["x-ui", "stack"])
+    parser.add_argument("component", nargs="?", choices=["x-ui", "stack", "site"])
+    parser.add_argument("--site-root", default=DEFAULT_SITE_ROOT)
     args = parser.parse_args()
     if args.command in {"manifest", "backup"} and not args.component:
         parser.error("component is required")
     if args.command == "manifest":
-        result = {"component": args.component, "fingerprint": fingerprint(args.component)}
+        result = {"component": args.component, "fingerprint": fingerprint(args.component, args.site_root)}
     elif args.command == "backup":
-        result = make_backup(args.component)
+        result = make_backup(args.component, args.site_root)
     else:
         result = status()
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))

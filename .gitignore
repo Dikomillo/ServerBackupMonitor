@@ -3,6 +3,7 @@ config.json
 state.json
 logs/
 backups/
+.repowise
 
 # Python and editor files
 __pycache__/

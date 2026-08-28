@@ -19,6 +19,14 @@
       "panel_url": "https://vpn.example.com:2053/your-panel-path/",
       "components": ["x-ui", "stack"],
       "key": "%USERPROFILE%\\.ssh\\id_ed25519"
+    },
+    {
+      "name": "static-site",
+      "host": "203.0.113.30",
+      "panel_url": "https://203.0.113.30:2053/your-panel-path/",
+      "site_url": "https://www.example.com/",
+      "site_root": "/var/www/example.com",
+      "components": ["x-ui", "site"]
     }
   ]
 }

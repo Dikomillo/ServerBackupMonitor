@@ -26,7 +26,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "Dikomillo/ServerBackupMonitor"
 UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 CONFIG_PATH = BASE / "config.json"
@@ -42,7 +42,7 @@ CONFIG_DEFAULTS = {
     "lock_port": 47651,
     "check_updates": True,
 }
-SUPPORTED_COMPONENTS = {"x-ui", "stack"}
+SUPPORTED_COMPONENTS = {"x-ui", "stack", "site"}
 
 
 class Color:
@@ -82,7 +82,9 @@ class Logger:
         if event:
             self.events.append((now.strftime("%H:%M:%S"), level, message))
         if not self.quiet:
-            print(f"{Color.CYAN}{line[:21]}{Color.RESET}{color}{line[21:]}{Color.RESET}", flush=True)
+            encoding = sys.stdout.encoding or "utf-8"
+            display = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            print(f"{Color.CYAN}{display[:21]}{Color.RESET}{color}{display[21:]}{Color.RESET}", flush=True)
         with self.path.open("a", encoding="utf-8") as log:
             log.write(line + "\n")
 
@@ -186,7 +188,12 @@ class Dashboard:
         online_servers = sum(bool(row.get("ssh")) for row in monitor.status_results)
         total_servers = len(monitor.config["servers"])
         all_ok = internet_ok is True and online_servers == total_servers and all(
-            row.get("remote", {}).get("x_ui") == "active" and 200 <= row.get("panel", 0) < 400
+            row.get("remote", {}).get("x_ui") == "active"
+            and 200 <= row.get("panel", 0) < 400
+            and (
+                "site" not in row["server"].get("components", [])
+                or (200 <= row.get("site", 0) < 400 and row.get("remote", {}).get("nginx") == "active")
+            )
             for row in monitor.status_results
         )
         overall = self.badge(all_ok, "ВСЁ РАБОТАЕТ", "ТРЕБУЕТ ВНИМАНИЯ")
@@ -228,6 +235,11 @@ class Dashboard:
                     cell(paint(server["name"], Color.BOLD + Color.WHITE), 10) +
                     cell(server["host"], 18) + cell(ssh, 18) + cell(xui, 15) + cell(panel, 16) + services
                 ))
+            if "site" in server.get("components", []):
+                site_code = row.get("site", 0) if row else 0
+                site = self.badge(200 <= site_code < 400, f"HTTP {site_code}", "НЕДОСТУПЕН")
+                nginx_ok = row and row.get("remote", {}).get("nginx") == "active"
+                out.append(self.line(f"  Сайт: {site}   {self.badge(nginx_ok, 'Nginx ACTIVE', 'Nginx STOPPED')}"))
         out.append(self.rule())
         out.append(self.line(paint("РЕЗЕРВНЫЕ КОПИИ", Color.BOLD + Color.CYAN)))
         if compact:
@@ -314,11 +326,19 @@ def load_config(path=CONFIG_PATH):
         if not isinstance(components, list) or "x-ui" not in components or len(components) != len(set(components)) or not set(components) <= SUPPORTED_COMPONENTS:
             allowed = ", ".join(sorted(SUPPORTED_COMPONENTS))
             raise ValueError(f"{name}: components должен содержать x-ui и может дополнительно содержать {allowed}")
+        site_url = str(item.get("site_url", "")).strip()
+        site_root = str(item.get("site_root", "/var/www/example.com")).strip()
+        if "site" in components:
+            parsed_site_url = urllib.parse.urlparse(site_url)
+            if parsed_site_url.scheme not in {"http", "https"} or not parsed_site_url.netloc:
+                raise ValueError(f"{name}: для компонента site нужен полный site_url HTTP(S)")
+            if not re.fullmatch(r"/[A-Za-z0-9._/-]+", site_root) or site_root == "/" or ".." in site_root.split("/"):
+                raise ValueError(f"{name}: site_root должен быть безопасным абсолютным Linux-путём")
         if name in names or folder in folders:
             raise ValueError(f"Дублируется имя или папка сервера: {name}")
         names.add(name)
         folders.add(folder)
-        server = {**item, "name": name, "host": host, "panel_url": panel_url, "folder": folder, "user": item.get("user") or "root", "components": components}
+        server = {**item, "name": name, "host": host, "panel_url": panel_url, "site_url": site_url, "site_root": site_root, "folder": folder, "user": item.get("user") or "root", "components": components}
         if server.get("key"):
             server["key"] = str(local_path(server["key"]))
         normalized.append(server)
@@ -464,12 +484,15 @@ class Monitor:
                 if attempt == 0:
                     time.sleep(1)
         panel_code, panel_error = self.panel_status(server["panel_url"])
+        site_code, site_error = (self.panel_status(server["site_url"]) if "site" in server.get("components", []) else (None, ""))
         return {
             "server": server,
             "ssh": ssh_ok,
             "ssh_error": error,
             "panel": panel_code,
             "panel_error": panel_error,
+            "site": site_code,
+            "site_error": site_error,
             "remote": remote,
             "latency": time.monotonic() - started,
         }
@@ -499,6 +522,10 @@ class Monitor:
         ssh_transition = self.record_health(f"{name}:ssh", result["ssh"], result["ssh_error"])
         panel_ok = 200 <= result["panel"] < 400
         panel_transition = self.record_health(f"{name}:panel", panel_ok, result["panel_error"])
+        site_enabled = "site" in server.get("components", [])
+        site_ok = not site_enabled or 200 <= result["site"] < 400
+        site_transition = self.record_health(f"{name}:site", site_ok, result["site_error"]) if site_enabled else None
+        nginx_ok = not site_enabled or result["remote"].get("nginx") == "active"
         if ssh_transition:
             was_online, elapsed = ssh_transition
             if was_online:
@@ -511,6 +538,12 @@ class Monitor:
                 self.log.error(f"{name}: панель стала недоступна; до этого работала {duration(elapsed)}")
             else:
                 self.log.ok(f"{name}: панель снова доступна; простой {duration(elapsed)}")
+        if site_transition:
+            was_online, elapsed = site_transition
+            if was_online:
+                self.log.error(f"{name}: сайт стал недоступен; до этого работал {duration(elapsed)}")
+            else:
+                self.log.ok(f"{name}: сайт снова доступен; простой {duration(elapsed)}")
 
         if not result["ssh"]:
             self.log.error(f"{name}: SSH недоступен — {result['ssh_error']}", event=not bool(ssh_transition))
@@ -520,12 +553,14 @@ class Monitor:
         containers = ", ".join(remote.get("containers", [])) or "нет/не проверяются"
         panel = result["panel"] or "DOWN"
         message = f"{name}: SSH {result['latency']:.1f}с | x-ui {xui} | панель {panel}"
+        if site_enabled:
+            message += f" | сайт {result['site'] or 'DOWN'} | nginx {remote.get('nginx', 'unknown')}"
         if "stack" in server.get("components", []):
             message += f" | Docker: {containers}"
-        if xui == "active" and panel_ok:
+        if xui == "active" and panel_ok and site_ok and nginx_ok:
             self.log.ok(message, event=False)
         else:
-            self.log.warn(message, event=not bool(ssh_transition or panel_transition))
+            self.log.warn(message, event=not bool(ssh_transition or panel_transition or site_transition))
 
     def monitor_once(self):
         self.phase = "Проверяю интернет…"
@@ -557,7 +592,10 @@ class Monitor:
         self.refresh()
 
     def remote_manifest(self, server, component):
-        return self.remote_json(server, "manifest", component, timeout=120)["fingerprint"]
+        args = ["manifest", component]
+        if component == "site":
+            args += ["--site-root", server["site_root"]]
+        return self.remote_json(server, *args, timeout=120)["fingerprint"]
 
     def remove_remote_archive(self, server, remote_path):
         if not remote_path.startswith("/tmp/") or not remote_path.endswith(".tar.gz"):
@@ -565,7 +603,10 @@ class Monitor:
         run(self.ssh_base(server) + [f"rm -f -- '{remote_path}'"], timeout=20)
 
     def download_backup(self, server, component, destination):
-        result = self.remote_json(server, "backup", component, timeout=600)
+        args = ["backup", component]
+        if component == "site":
+            args += ["--site-root", server["site_root"]]
+        result = self.remote_json(server, *args, timeout=600)
         remote_path = result["archive"]
         destination.mkdir(parents=True, exist_ok=True)
         archive = destination / Path(remote_path).name
@@ -764,8 +805,12 @@ class BackupGUI:
         self.ip_buttons = {}
         self.root = tk.Tk()
         self.root.title("Server Backup Monitor")
-        self.root.geometry("1180x790")
-        self.root.minsize(960, 660)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width = min(1180, max(960, screen_width - 80))
+        height = min(790, max(600, screen_height - 100))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(960, 600)
         self.root.configure(bg=self.BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.build_styles()
@@ -829,8 +874,20 @@ class BackupGUI:
         ttk.Button(controls, text="Настройки", command=lambda: os.startfile(str(CONFIG_PATH))).grid(row=0, column=5, padx=(6, 0), pady=7)
         ttk.Button(controls, text="В трей", style="Small.TButton", command=self.minimize_to_tray).grid(row=0, column=6, padx=(6, 16), pady=7)
 
-        body = tk.Frame(root, bg=self.BG)
-        body.grid(row=1, column=0, sticky="nsew", padx=20)
+        body_host = tk.Frame(root, bg=self.BG)
+        body_host.grid(row=1, column=0, sticky="nsew")
+        body_host.grid_columnconfigure(0, weight=1)
+        body_host.grid_rowconfigure(0, weight=1)
+        self.body_canvas = tk.Canvas(body_host, bg=self.BG, highlightthickness=0)
+        self.body_canvas.grid(row=0, column=0, sticky="nsew")
+        body_scroll = ttk.Scrollbar(body_host, orient="vertical", command=self.body_canvas.yview)
+        body_scroll.grid(row=0, column=1, sticky="ns")
+        self.body_canvas.configure(yscrollcommand=body_scroll.set)
+        body = tk.Frame(self.body_canvas, bg=self.BG, padx=20)
+        body_window = self.body_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _event: self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all")))
+        self.body_canvas.bind("<Configure>", lambda event: self.body_canvas.itemconfigure(body_window, width=event.width))
+        self.body_canvas.bind_all("<MouseWheel>", lambda event: self.body_canvas.yview_scroll(-int(event.delta / 120), "units"))
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(2, weight=1)
         cards_host = tk.Frame(body, bg=self.BG)
@@ -839,18 +896,14 @@ class BackupGUI:
         self.cards_canvas.pack(fill="x")
         self.cards_frame = tk.Frame(self.cards_canvas, bg=self.BG)
         cards_window = self.cards_canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
-        self.cards_frame.bind("<Configure>", lambda _event: self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox("all")))
-        if len(self.config["servers"]) <= 3:
-            self.cards_canvas.bind("<Configure>", lambda event: self.cards_canvas.itemconfigure(cards_window, width=event.width))
-        else:
-            cards_scroll = ttk.Scrollbar(cards_host, orient="horizontal", command=self.cards_canvas.xview)
-            self.cards_canvas.configure(xscrollcommand=cards_scroll.set)
-            cards_scroll.pack(fill="x", pady=(4, 0))
+        self.cards_frame.bind("<Configure>", self.resize_cards)
+        self.cards_canvas.bind("<Configure>", lambda event: (self.cards_canvas.itemconfigure(cards_window, width=event.width), self.reflow_cards(event)))
         self.cards = {}
+        self.card_widgets = []
         for index, server in enumerate(self.config["servers"]):
-            self.cards_frame.grid_columnconfigure(index, weight=1 if len(self.config["servers"]) <= 3 else 0, minsize=330)
             card = tk.Frame(self.cards_frame, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
             card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 6, 0))
+            self.card_widgets.append(card)
             card.grid_columnconfigure(1, weight=1)
             self.label(card, server["name"], 12, self.TEXT, True).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 2))
             host_frame = tk.Frame(card, bg=self.CARD)
@@ -865,12 +918,12 @@ class BackupGUI:
             self.ip_buttons[server["name"]] = ip_button
             tk.Frame(card, bg=self.BORDER, height=1).grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(9, 5))
             values = {}
-            rows = (("ssh", "SSH"), ("xui", "X-UI"), ("panel", "ПАНЕЛЬ"), ("services", "СЕРВИСЫ"))
+            rows = (("ssh", "SSH"), ("xui", "X-UI"), ("panel", "ПАНЕЛЬ"), ("site", "САЙТ"), ("services", "СЕРВИСЫ"))
             for row_index, (key, caption) in enumerate(rows, start=3):
                 self.label(card, caption, 8, self.MUTED, True).grid(row=row_index, column=0, sticky="w", padx=(14, 10), pady=3)
                 values[key] = self.label(card, "Ожидание", 9, self.YELLOW)
                 values[key].grid(row=row_index, column=1, sticky="w", padx=(0, 14), pady=3)
-            card.grid_rowconfigure(7, minsize=9)
+            card.grid_rowconfigure(8, minsize=9)
             self.cards[server["name"]] = values
 
         backups = tk.Frame(body, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
@@ -1085,7 +1138,14 @@ class BackupGUI:
         status = self.monitor.status_results
         online = self.monitor.internet_state[0] is True
         ready = bool(status) and len(status) == len(self.config["servers"]) and online and all(
-            row.get("ssh") and row.get("remote", {}).get("x_ui") == "active" and 200 <= row.get("panel", 0) < 400 for row in status
+            row.get("ssh")
+            and row.get("remote", {}).get("x_ui") == "active"
+            and 200 <= row.get("panel", 0) < 400
+            and (
+                "site" not in row["server"].get("components", [])
+                or (200 <= row.get("site", 0) < 400 and row.get("remote", {}).get("nginx") == "active")
+            )
+            for row in status
         )
         self.overall_var.set("●  ВСЁ РАБОТАЕТ" if ready else ("●  ПРОВЕРКА…" if self.monitor.phase else "●  ТРЕБУЕТ ВНИМАНИЯ"))
         self.overall_label.configure(fg=self.GREEN if ready else (self.YELLOW if self.monitor.phase else self.RED))
@@ -1102,6 +1162,11 @@ class BackupGUI:
             self.set_status(card["xui"], "Работает" if xui_ok else "Остановлен", xui_ok)
             panel_ok = 200 <= row.get("panel", 0) < 400
             self.set_status(card["panel"], f"Доступна  ·  HTTP {row.get('panel', 0)}" if panel_ok else "Недоступна", panel_ok)
+            if "site" in row["server"].get("components", []):
+                site_ok = 200 <= row.get("site", 0) < 400
+                self.set_status(card["site"], f"Доступен  ·  HTTP {row.get('site', 0)}" if site_ok else "Недоступен", site_ok)
+            else:
+                card["site"].configure(text="—", fg=self.MUTED)
             services = self.service_text(row.get("remote", {}).get("containers", []))
             card["services"].configure(text=services, fg=self.GREEN if services != "● Docker не используется" else self.MUTED)
         for item in self.backup_tree.get_children():
@@ -1131,6 +1196,23 @@ class BackupGUI:
             self.events_text.configure(state="disabled")
             self.event_snapshot = snapshot
         self.root.after(1000, self.refresh_ui)
+
+    def resize_cards(self, _event=None):
+        bounds = self.cards_canvas.bbox("all")
+        if bounds:
+            self.cards_canvas.configure(scrollregion=bounds, height=max(196, bounds[3] - bounds[1]))
+
+    def reflow_cards(self, event=None):
+        cards = getattr(self, "card_widgets", [])
+        if not cards:
+            return
+        width = max(1, event.width if event else self.cards_canvas.winfo_width())
+        columns = max(1, min(len(cards), width // 360))
+        for index, card in enumerate(cards):
+            row, column = divmod(index, columns)
+            card.grid_configure(row=row, column=column, padx=(0 if column == 0 else 6, 0), pady=(0 if row == 0 else 6, 0))
+        for column in range(len(cards)):
+            self.cards_frame.grid_columnconfigure(column, weight=1 if column < columns else 0, minsize=0)
 
     def set_status(self, widget, text, ok):
         widget.configure(text=text, fg=self.GREEN if ok else self.RED)
@@ -1194,13 +1276,14 @@ def self_test():
         config_path = Path(tmp) / "config.json"
         save_json(config_path, {"servers": [
             {"host": "203.0.113.10", "panel_url": "https://203.0.113.10/panel/"},
-            {"name": "second", "host": "vpn.example.com", "panel_url": "https://vpn.example.com/panel/", "components": ["x-ui", "stack"]},
+            {"name": "second", "host": "vpn.example.com", "panel_url": "https://vpn.example.com/panel/", "site_url": "https://www.example.com/", "site_root": "/var/www/example.com", "components": ["x-ui", "stack", "site"]},
         ]})
         checked = load_config(config_path)
         assert checked["retention_count"] == 30
         assert checked["servers"][0]["name"] == "203.0.113.10"
         assert checked["servers"][0]["folder"] == "203.0.113.10"
-        assert checked["servers"][1]["components"] == ["x-ui", "stack"]
+        assert checked["servers"][1]["components"] == ["x-ui", "stack", "site"]
+        assert checked["servers"][1]["site_root"] == "/var/www/example.com"
         monitor = object.__new__(Monitor)
         monitor.config = {"backup_root": tmp, "retention_count": 30}
         monitor.archive_root().mkdir()
