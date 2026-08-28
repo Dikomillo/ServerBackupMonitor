@@ -1,0 +1,17 @@
+# Private configuration and runtime state
+config.json
+state.json
+logs/
+backups/
+
+# Python and editor files
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+.idea/
+
+# Local backup artifacts
+*.zip
+*.tar.gz
+*.tmp

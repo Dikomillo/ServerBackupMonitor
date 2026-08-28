@@ -1,0 +1,23 @@
+{
+  "backup_root": "backups",
+  "status_interval_seconds": 3600,
+  "backup_interval_seconds": 18000,
+  "retention_count": 30,
+  "lock_port": 47651,
+  "servers": [
+    {
+      "name": "xui-1",
+      "host": "203.0.113.10",
+      "panel_url": "https://203.0.113.10:2053/your-panel-path/",
+      "components": ["x-ui"]
+    },
+    {
+      "name": "xui-with-docker-stack",
+      "host": "198.51.100.20",
+      "user": "root",
+      "panel_url": "https://vpn.example.com:2053/your-panel-path/",
+      "components": ["x-ui", "stack"],
+      "key": "%USERPROFILE%\\.ssh\\id_ed25519"
+    }
+  ]
+}
