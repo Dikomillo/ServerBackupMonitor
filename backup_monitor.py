@@ -327,11 +327,13 @@ def load_config(path=CONFIG_PATH):
             allowed = ", ".join(sorted(SUPPORTED_COMPONENTS))
             raise ValueError(f"{name}: components должен содержать x-ui и может дополнительно содержать {allowed}")
         site_url = str(item.get("site_url", "")).strip()
-        site_root = str(item.get("site_root", "/var/www/example.com")).strip()
+        site_root = str(item.get("site_root", "")).strip()
         if "site" in components:
             parsed_site_url = urllib.parse.urlparse(site_url)
             if parsed_site_url.scheme not in {"http", "https"} or not parsed_site_url.netloc:
                 raise ValueError(f"{name}: для компонента site нужен полный site_url HTTP(S)")
+            if not site_root:
+                raise ValueError(f"{name}: для компонента site обязательно укажите site_root")
             if not re.fullmatch(r"/[A-Za-z0-9._/-]+", site_root) or site_root == "/" or ".." in site_root.split("/"):
                 raise ValueError(f"{name}: site_root должен быть безопасным абсолютным Linux-путём")
         if name in names or folder in folders:
