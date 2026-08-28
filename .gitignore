@@ -1,4 +1,5 @@
 # Private configuration and runtime state
+AGENTS.md
 config.json
 state.json
 logs/
