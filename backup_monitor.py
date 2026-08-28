@@ -18,6 +18,7 @@ import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 import zipfile
 from collections import deque
 from datetime import datetime
@@ -25,6 +26,9 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 BASE = Path(__file__).resolve().parent
+APP_VERSION = "1.0.0"
+GITHUB_REPO = "Dikomillo/ServerBackupMonitor"
+UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 CONFIG_PATH = BASE / "config.json"
 CONFIG_EXAMPLE_PATH = BASE / "config.example.json"
 STATE_PATH = BASE / "state.json"
@@ -36,6 +40,7 @@ CONFIG_DEFAULTS = {
     "backup_interval_seconds": 18000,
     "retention_count": 30,
     "lock_port": 47651,
+    "check_updates": True,
 }
 SUPPORTED_COMPONENTS = {"x-ui", "stack"}
 
@@ -121,6 +126,30 @@ def countdown(target):
 
 def format_size(size):
     return f"{size / 1024:.0f} КБ" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} МБ"
+
+
+def version_tuple(value):
+    match = re.search(r"\d+(?:\.\d+){0,2}", str(value))
+    if not match:
+        return ()
+    parts = [int(part) for part in match.group(0).split(".")]
+    return tuple((parts + [0, 0, 0])[:3])
+
+
+def latest_release():
+    request = urllib.request.Request(
+        UPDATE_API_URL,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "ServerBackupMonitor"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        release = json.load(response)
+    version = version_tuple(release.get("tag_name") or release.get("name", ""))
+    if not version or version <= version_tuple(APP_VERSION):
+        return None
+    return {
+        "version": ".".join(str(part) for part in version),
+        "url": release.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases",
+    }
 
 
 class Dashboard:
@@ -259,6 +288,8 @@ def load_config(path=CONFIG_PATH):
             raise ValueError(f"{key} должен быть целым числом") from None
         if config[key] <= 0:
             raise ValueError(f"{key} должен быть больше нуля")
+    if not isinstance(config["check_updates"], bool):
+        raise ValueError("check_updates должен быть true или false")
     config["backup_root"] = str(local_path(config["backup_root"]))
     servers = config.get("servers")
     if not isinstance(servers, list) or not servers:
@@ -722,6 +753,12 @@ class BackupGUI:
         self.backup_event = threading.Event()
         self.force_event = threading.Event()
         self.event_snapshot = None
+        self.events_initialized = False
+        self.last_notified_event = None
+        self.update_info = None
+        self.tray_icon = None
+        self.tray_ready = False
+        self.tray_error = ""
         self.ip_hidden = True
         self.ip_vars = {}
         self.ip_buttons = {}
@@ -733,9 +770,11 @@ class BackupGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.build_styles()
         self.build_ui()
+        self.setup_tray()
         self.worker = threading.Thread(target=self.worker_loop, name="backup-worker", daemon=True)
         self.worker.start()
         self.root.after(500, self.refresh_ui)
+        self.root.after(100, self.check_for_updates)
 
     def build_styles(self):
         style = ttk.Style(self.root)
@@ -775,6 +814,9 @@ class BackupGUI:
         self.overall_label = self.label(right, textvariable=self.overall_var, size=10, color=self.YELLOW, bold=True)
         self.overall_label.pack(anchor="e")
         self.label(right, textvariable=self.internet_var, size=9, color=self.MUTED).pack(anchor="e", pady=(2, 0))
+        self.label(right, f"Версия v{APP_VERSION}", 8, self.MUTED).pack(anchor="e", pady=(3, 0))
+        self.update_button = ttk.Button(right, text="Проверка обновлений…", style="Small.TButton", state="disabled", command=self.open_update)
+        self.update_button.pack(anchor="e", pady=(3, 0))
 
         controls = tk.Frame(header, bg=self.CARD_ALT)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew")
@@ -784,7 +826,8 @@ class BackupGUI:
         ttk.Button(controls, text="Сохранить изменения", style="Primary.TButton", command=self.request_smart_backup).grid(row=0, column=2, padx=(6, 0), pady=7)
         ttk.Button(controls, text="Создать все копии", command=self.request_force).grid(row=0, column=3, padx=(6, 0), pady=7)
         ttk.Button(controls, text="Архивы", command=lambda: os.startfile(self.monitor.archive_root())).grid(row=0, column=4, padx=(6, 0), pady=7)
-        ttk.Button(controls, text="Настройки", command=lambda: os.startfile(str(CONFIG_PATH))).grid(row=0, column=5, padx=(6, 16), pady=7)
+        ttk.Button(controls, text="Настройки", command=lambda: os.startfile(str(CONFIG_PATH))).grid(row=0, column=5, padx=(6, 0), pady=7)
+        ttk.Button(controls, text="В трей", style="Small.TButton", command=self.minimize_to_tray).grid(row=0, column=6, padx=(6, 16), pady=7)
 
         body = tk.Frame(root, bg=self.BG)
         body.grid(row=1, column=0, sticky="nsew", padx=20)
@@ -875,8 +918,9 @@ class BackupGUI:
 
         footer = tk.Frame(root, bg=self.BG)
         footer.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 12))
-        footer_text = f"Доступность — {duration(self.config['status_interval_seconds'])}    ·    изменения — {duration(self.config['backup_interval_seconds'])}    ·    хранение — {self.config['retention_count']} архивов"
-        self.label(footer, footer_text, 8, self.MUTED).pack(anchor="w")
+        self.label(footer, f"Архивы: {self.monitor.archive_root()}", 8, self.MUTED).pack(anchor="w")
+        footer_text = f"Проверка — {duration(self.config['status_interval_seconds'])}    ·    дифф — {duration(self.config['backup_interval_seconds'])}    ·    хранение — {self.config['retention_count']} архивов"
+        self.label(footer, footer_text, 8, self.MUTED).pack(anchor="w", pady=(2, 0))
 
     def request_check(self):
         self.status_event.set()
@@ -914,6 +958,80 @@ class BackupGUI:
 
     def show_event_menu(self, event):
         self.event_menu.tk_popup(event.x_root, event.y_root)
+
+    def setup_tray(self):
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            image = Image.new("RGB", (64, 64), self.BG)
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((2, 2, 62, 62), radius=13, fill=self.BLUE)
+            draw.text((15, 19), "SB", fill="#08101B")
+            menu = pystray.Menu(
+                pystray.MenuItem("Открыть", lambda icon, item: self.root.after(0, self.restore_from_tray)),
+                pystray.MenuItem("Свернуть в трей", lambda icon, item: self.root.after(0, self.minimize_to_tray)),
+                pystray.MenuItem("Выход", lambda icon, item: self.root.after(0, self.close)),
+            )
+            self.tray_icon = pystray.Icon("ServerBackupMonitor", image, "Server Backup Monitor", menu)
+            threading.Thread(target=self.tray_icon.run, name="tray", daemon=True).start()
+            self.tray_ready = True
+        except ImportError as exc:
+            self.tray_error = str(exc)
+
+    def minimize_to_tray(self):
+        if self.tray_ready:
+            self.root.withdraw()
+            self.next_var.set("Монитор работает в трее")
+        else:
+            self.root.iconify()
+            if self.tray_error:
+                messagebox.showinfo("Трей недоступен", "Установите зависимости командой:\npython -m pip install -r requirements.txt")
+
+    def restore_from_tray(self):
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def check_for_updates(self):
+        if not self.config["check_updates"]:
+            self.update_button.configure(text="Проверка отключена")
+            return
+        threading.Thread(target=self.update_worker, name="update-check", daemon=True).start()
+
+    def update_worker(self):
+        try:
+            release = latest_release()
+        except (OSError, ValueError, urllib.error.URLError):
+            return
+        if release:
+            self.root.after(0, lambda: self.show_update(release))
+        else:
+            self.root.after(0, lambda: self.update_button.configure(text="Актуальная версия", state="disabled"))
+
+    def show_update(self, release):
+        self.update_info = release
+        self.update_button.configure(text=f"Доступна v{release['version']}", state="normal")
+        self.notify("Доступна новая версия программы", "Обновление")
+
+    def open_update(self):
+        if self.update_info:
+            webbrowser.open(self.update_info["url"])
+
+    def notify(self, message, title="Server Backup Monitor"):
+        try:
+            if self.tray_ready and self.tray_icon:
+                self.tray_icon.notify(message, title)
+            else:
+                self.root.bell()
+        except Exception:
+            self.root.bell()
+
+    def notify_event(self, event):
+        stamp, level, message = event
+        if level in {"WARN", "FAIL"} or "Точка восстановления сохранена" in message:
+            self.notify(message, f"Server Backup Monitor · {level}")
 
     def toggle_ip(self, name):
         self.ip_hidden = not self.ip_hidden
@@ -997,6 +1115,13 @@ class BackupGUI:
                 fp = item.get("fingerprint") or self.monitor.state.get("fingerprints", {}).get(server["name"], {}).get(component, "")
                 self.backup_tree.insert("", "end", values=(key, item.get("text", "Ожидание"), fp[:12] or "—", item.get("checked", "—")), tags=(tag,))
         snapshot = tuple(self.log.events)
+        latest = snapshot[-1] if snapshot else None
+        if not self.events_initialized:
+            self.last_notified_event = latest
+            self.events_initialized = True
+        elif latest and latest != self.last_notified_event:
+            self.notify_event(latest)
+            self.last_notified_event = latest
         if snapshot != self.event_snapshot and not self.events_text.tag_ranges("sel"):
             self.events_text.configure(state="normal")
             self.events_text.delete("1.0", "end")
@@ -1022,6 +1147,8 @@ class BackupGUI:
     def close(self):
         self.stop_event.set()
         self.wake_event.set()
+        if self.tray_icon:
+            self.tray_icon.stop()
         self.root.destroy()
 
     def run(self):
@@ -1033,6 +1160,8 @@ def self_test():
     assert duration(3600) == "1 ч 0 мин"
     assert format_size(42 * 1024) == "42 КБ"
     assert format_size(1536 * 1024) == "1.5 МБ"
+    assert version_tuple("v1.2.3-beta") == (1, 2, 3)
+    assert version_tuple("release-without-version") == ()
     sample = "noise\n{\"ok\":true}\n"
     assert parse_json_output(sample) == {"ok": True}
     assert visible_len(paint("ONLINE", Color.GREEN)) == 6

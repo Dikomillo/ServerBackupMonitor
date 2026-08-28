@@ -4,6 +4,7 @@
   "backup_interval_seconds": 18000,
   "retention_count": 30,
   "lock_port": 47651,
+  "check_updates": true,
   "servers": [
     {
       "name": "xui-1",
