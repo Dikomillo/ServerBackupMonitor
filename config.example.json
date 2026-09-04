@@ -5,10 +5,16 @@
   "retention_count": 30,
   "lock_port": 47651,
   "check_updates": true,
+  "router_backup": {
+    "script": "C:\\Tools\\RouterBackup\\backup-router.ps1",
+    "target": "root@203.0.113.1",
+    "destination": "router-backups"
+  },
   "servers": [
     {
       "name": "xui-1",
       "host": "203.0.113.10",
+      "ssh_host": "2001:db8::2",
       "panel_url": "https://203.0.113.10:2053/your-panel-path/",
       "components": ["x-ui"]
     },

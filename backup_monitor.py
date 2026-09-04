@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import hashlib
+import ipaddress
 import io
 import json
 import os
@@ -33,6 +35,7 @@ CONFIG_PATH = BASE / "config.json"
 CONFIG_EXAMPLE_PATH = BASE / "config.example.json"
 STATE_PATH = BASE / "state.json"
 LOG_DIR = BASE / "logs"
+SETTINGS_BACKUP_DIR = BASE / "settings-backups"
 AGENT_PATH = BASE / "remote_backup_agent.py"
 CONFIG_DEFAULTS = {
     "backup_root": "backups",
@@ -41,6 +44,7 @@ CONFIG_DEFAULTS = {
     "retention_count": 30,
     "lock_port": 47651,
     "check_updates": True,
+    "router_backup": None,
 }
 SUPPORTED_COMPONENTS = {"x-ui", "stack", "site"}
 
@@ -75,18 +79,20 @@ class Logger:
         self.path = LOG_DIR / f"monitor-{datetime.now():%Y-%m}.log"
         self.quiet = quiet
         self.events = deque(maxlen=20)
+        self.lock = threading.Lock()
 
     def write(self, level, message, color=Color.RESET, event=True):
-        now = datetime.now()
-        line = f"[{now:%Y-%m-%d %H:%M:%S}] {level:<4} {message}"
-        if event:
-            self.events.append((now.strftime("%H:%M:%S"), level, message))
-        if not self.quiet:
-            encoding = sys.stdout.encoding or "utf-8"
-            display = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
-            print(f"{Color.CYAN}{display[:21]}{Color.RESET}{color}{display[21:]}{Color.RESET}", flush=True)
-        with self.path.open("a", encoding="utf-8") as log:
-            log.write(line + "\n")
+        with self.lock:
+            now = datetime.now()
+            line = f"[{now:%Y-%m-%d %H:%M:%S}] {level:<4} {message}"
+            if event:
+                self.events.append((now.strftime("%H:%M:%S"), level, message))
+            if not self.quiet:
+                encoding = sys.stdout.encoding or "utf-8"
+                display = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                print(f"{Color.CYAN}{display[:21]}{Color.RESET}{color}{display[21:]}{Color.RESET}", flush=True)
+            with self.path.open("a", encoding="utf-8") as log:
+                log.write(line + "\n")
 
     def ok(self, message, event=True):
         self.write("OK", message, Color.GREEN, event)
@@ -274,7 +280,7 @@ class Dashboard:
 
 def load_json(path, default):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return default
 
@@ -303,6 +309,18 @@ def load_config(path=CONFIG_PATH):
     if not isinstance(config["check_updates"], bool):
         raise ValueError("check_updates должен быть true или false")
     config["backup_root"] = str(local_path(config["backup_root"]))
+    router = config.get("router_backup")
+    if router is not None:
+        if not isinstance(router, dict) or not all(str(router.get(key, "")).strip() for key in ("script", "target", "destination")):
+            raise ValueError("router_backup должен содержать script, target и destination")
+        target = str(router["target"]).strip()
+        if any(char in target for char in "\r\n"):
+            raise ValueError("router_backup.target содержит недопустимые символы")
+        config["router_backup"] = {
+            "script": str(local_path(router["script"])),
+            "target": target,
+            "destination": str(local_path(router["destination"])),
+        }
     servers = config.get("servers")
     if not isinstance(servers, list) or not servers:
         raise ValueError("Добавьте хотя бы один сервер в servers")
@@ -357,6 +375,37 @@ def save_json(path, value):
     os.replace(temp, path)
 
 
+def create_settings_backup(destination=SETTINGS_BACKUP_DIR, config_path=CONFIG_PATH, state_path=STATE_PATH):
+    destination = Path(destination)
+    config_path, state_path = Path(config_path), Path(state_path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Не найден {config_path.name}")
+    destination.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    final = destination / f"server-backup-monitor-settings-{stamp}.zip"
+    suffix = 1
+    while final.exists():
+        final = destination / f"server-backup-monitor-settings-{stamp}-{suffix}.zip"
+        suffix += 1
+    partial = final.with_suffix(".zip.tmp")
+    try:
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for source in (config_path, state_path):
+                if source.is_file():
+                    bundle.write(source, source.name)
+            bundle.writestr("metadata.json", json.dumps({
+                "created_at": datetime.now().isoformat(),
+                "files": [source.name for source in (config_path, state_path) if source.is_file()],
+            }, ensure_ascii=False, indent=2) + "\n")
+        with zipfile.ZipFile(partial) as bundle:
+            if broken := bundle.testzip():
+                raise RuntimeError(f"Повреждён файл внутри ZIP: {broken}")
+        os.replace(partial, final)
+        return final
+    finally:
+        partial.unlink(missing_ok=True)
+
+
 def run(command, timeout=60):
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     return subprocess.run(
@@ -394,11 +443,13 @@ class Monitor:
         self.log = logger
         self.state = load_json(STATE_PATH, {"fingerprints": {}, "health": {}})
         self.uploaded = set()
+        self.upload_lock = threading.Lock()
         self.agent_hash = hashlib.sha256(AGENT_PATH.read_bytes()).hexdigest()
         self.remote_agent = f"/tmp/server-backup-agent-{self.agent_hash[:12]}.py"
         self.dashboard = None
         self.status_results = []
         self.backup_status = {}
+        self.router_status_result = {"configured": bool(config.get("router_backup")), "ssh": False}
         self.internet_state = (None, "")
         self.phase = "Запуск…"
         self.next_status_at = None
@@ -410,35 +461,65 @@ class Monitor:
         if self.dashboard:
             self.dashboard.render(self)
 
-    def target(self, server):
-        return f"{server['user']}@{server['host']}"
+    def target(self, server, scp=False):
+        host = server.get("ssh_host", server["host"])
+        try:
+            is_ipv6 = ipaddress.ip_address(host).version == 6
+        except ValueError:
+            is_ipv6 = False
+        if scp and is_ipv6:
+            host = f"[{host}]"
+        return f"{server['user']}@{host}"
 
     def ssh_base(self, server):
         args = [
             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
             "-o", "StrictHostKeyChecking=yes", "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=1",
+            "-o", "ServerAliveCountMax=1", "-o", "ControlMaster=no",
         ]
+        if server.get("ssh_host", "").count(":") >= 2:
+            args.append("-6")
         if server.get("key"):
             args += ["-i", server["key"]]
         return args + [self.target(server)]
 
     def scp_base(self, server):
-        args = ["scp", "-O", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes"]
+        args = ["scp", "-O", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no"]
         if server.get("key"):
             args += ["-i", server["key"]]
+        if server.get("ssh_host", "").count(":") >= 2:
+            args.append("-6")
         return args
+
+    def router_ssh_base(self):
+        router = self.config.get("router_backup")
+        if not router:
+            raise RuntimeError("Резервирование роутера не настроено")
+        target = router["target"]
+        _, separator, host = target.rpartition("@")
+        if not separator or not host or any(char.isspace() for char in target):
+            raise RuntimeError("Некорректный router_backup.target")
+        host = host.strip("[]")
+        args = [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=1", "-o", "ControlMaster=no",
+        ]
+        if host.count(":") >= 2:
+            args.append("-6")
+        return args + [target]
 
     def ensure_agent(self, server):
         name = server["name"]
-        if name in self.uploaded:
-            return
-        check = run(self.ssh_base(server) + [f"test -f {self.remote_agent}"], timeout=15)
-        if check.returncode != 0:
-            upload = run(self.scp_base(server) + [str(AGENT_PATH), f"{self.target(server)}:{self.remote_agent}"], timeout=30)
-            if upload.returncode != 0:
-                raise RuntimeError(upload.stderr.strip() or "cannot upload remote agent")
-        self.uploaded.add(name)
+        with self.upload_lock:
+            if name in self.uploaded:
+                return
+            check = run(self.ssh_base(server) + [f"test -f {self.remote_agent}"], timeout=15)
+            if check.returncode != 0:
+                upload = run(self.scp_base(server) + [str(AGENT_PATH), f"{self.target(server, scp=True)}:{self.remote_agent}"], timeout=30)
+                if upload.returncode != 0:
+                    raise RuntimeError(upload.stderr.strip() or "cannot upload remote agent")
+            self.uploaded.add(name)
 
     def remote_json(self, server, *args, timeout=90):
         self.ensure_agent(server)
@@ -473,6 +554,14 @@ class Monitor:
         except Exception as exc:
             return 0, str(exc)
 
+    def panel_url6(self, server):
+        host = server.get("ssh_host", "")
+        if host.count(":") < 2:
+            return None
+        parsed = urllib.parse.urlsplit(server["panel_url"])
+        port = f":{parsed.port}" if parsed.port else ""
+        return urllib.parse.urlunsplit((parsed.scheme, f"[{host}]{port}", parsed.path, parsed.query, parsed.fragment))
+
     def server_status(self, server):
         started = time.monotonic()
         remote, ssh_ok, error = {}, False, ""
@@ -486,6 +575,10 @@ class Monitor:
                 if attempt == 0:
                     time.sleep(1)
         panel_code, panel_error = self.panel_status(server["panel_url"])
+        panel_transport = "IPv4"
+        if not 200 <= panel_code < 400 and (panel_url6 := self.panel_url6(server)):
+            panel_code, panel_error = self.panel_status(panel_url6)
+            panel_transport = "IPv6" if 200 <= panel_code < 400 else "IPv4/IPv6"
         site_code, site_error = (self.panel_status(server["site_url"]) if "site" in server.get("components", []) else (None, ""))
         return {
             "server": server,
@@ -493,11 +586,83 @@ class Monitor:
             "ssh_error": error,
             "panel": panel_code,
             "panel_error": panel_error,
+            "panel_transport": panel_transport,
             "site": site_code,
             "site_error": site_error,
             "remote": remote,
             "latency": time.monotonic() - started,
         }
+
+    def local_router_backup_status(self):
+        router = self.config.get("router_backup")
+        if not router:
+            return {"state": "not-configured", "text": "Не настроен"}
+        destination = Path(router["destination"])
+        candidates = sorted(
+            (path for path in destination.glob("OpenWrt-Cudy-WR3000S-v1-*") if path.is_dir() and not path.name.endswith("_INCOMPLETE")),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            return {"state": "missing", "text": "Полной копии нет"}
+        snapshot = candidates[0] / "snapshot"
+        try:
+            manifest = load_json(snapshot / "backup-manifest.json", {})
+        except (OSError, ValueError):
+            manifest = {}
+        archives = all((snapshot / name).is_file() for name in ("sysupgrade-backup.tar.gz", "overlay-full.tar.gz", "overlay-upper.tar.gz"))
+        hashes = (snapshot / "SHA256SUMS.local").is_file()
+        mtd = snapshot / "mtd"
+        mtd_files = list(mtd.glob("*.bin")) if mtd.is_dir() else []
+        full = archives and hashes and len(mtd_files) > 0 and manifest.get("mode") == "full"
+        checked_at = datetime.fromtimestamp(candidates[0].stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        text = f"Полная · {checked_at} · MTD {manifest.get('mtd_count', len(mtd_files))}" if full else "Нужна повторная проверка"
+        return {
+            "state": "ok" if full else "warning",
+            "text": text,
+            "name": candidates[0].name,
+            "full": full,
+        }
+
+    def router_status(self):
+        if not self.config.get("router_backup"):
+            return {"configured": False, "ssh": False, "backup": self.local_router_backup_status()}
+        command = (
+            "ubus call system board; printf '\\n__SBM_DF__\\n'; df -Pk /overlay; "
+            "printf '\\n__SBM_IPV6__\\n'; ip -6 addr show scope global; "
+            "printf '\\n__SBM_ROUTE__\\n'; ip -6 route show default"
+        )
+        try:
+            result = run(self.router_ssh_base() + [command], timeout=25)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "SSH недоступен")
+            board_text, df_text = result.stdout.split("\n__SBM_DF__\n", 1)
+            df_text, ipv6_text = df_text.split("\n__SBM_IPV6__\n", 1)
+            ipv6_text, route_text = ipv6_text.split("\n__SBM_ROUTE__\n", 1)
+            board = json.loads(board_text.strip())
+            overlay_line = next((line for line in df_text.splitlines() if "%" in line), "")
+            overlay_match = re.search(r"(\d+)%", overlay_line)
+            public_ipv6 = []
+            for line in ipv6_text.splitlines():
+                match = re.search(r"inet6\s+([^/]+)", line)
+                if match and not match.group(1).lower().startswith(("fe80:", "fd")):
+                    public_ipv6.append(match.group(1))
+            release = board.get("release", {})
+            return {
+                "configured": True,
+                "ssh": True,
+                "id": board.get("board_name") or board.get("model") or "unknown",
+                "model": board.get("model") or board.get("board_name") or "unknown",
+                "firmware": release.get("version") or "unknown",
+                "target": release.get("target") or "unknown",
+                "uptime": board.get("uptime"),
+                "ipv6": public_ipv6,
+                "default_ipv6": any(line.strip().startswith("default ") for line in route_text.splitlines()),
+                "overlay_used": overlay_match.group(1) if overlay_match else "?",
+                "backup": self.local_router_backup_status(),
+            }
+        except Exception as exc:
+            return {"configured": True, "ssh": False, "error": str(exc), "backup": self.local_router_backup_status()}
 
     def record_health(self, key, online, error=""):
         now = time.time()
@@ -553,7 +718,7 @@ class Monitor:
         remote = result["remote"]
         xui = remote.get("x_ui", "unknown")
         containers = ", ".join(remote.get("containers", [])) or "нет/не проверяются"
-        panel = result["panel"] or "DOWN"
+        panel = f"{result['panel'] or 'DOWN'} ({result.get('panel_transport', 'IPv4')})"
         message = f"{name}: SSH {result['latency']:.1f}с | x-ui {xui} | панель {panel}"
         if site_enabled:
             message += f" | сайт {result['site'] or 'DOWN'} | nginx {remote.get('nginx', 'unknown')}"
@@ -581,10 +746,30 @@ class Monitor:
         else:
             self.log.error(f"Интернет недоступен — {error}", event=not bool(transition))
         self.status_results = []
-        for server in self.config["servers"]:
-            self.phase = f"Проверяю {server['name']}…"
-            self.refresh()
-            result = self.server_status(server)
+        servers = self.config["servers"]
+        router_future = None
+        task_count = len(servers) + (1 if self.config.get("router_backup") else 0)
+        with ThreadPoolExecutor(max_workers=min(8, task_count), thread_name_prefix="status") as pool:
+            futures = [pool.submit(self.server_status, server) for server in servers]
+            if self.config.get("router_backup"):
+                router_future = pool.submit(self.router_status)
+            results = [future.result() for future in futures]
+            if router_future:
+                self.router_status_result = router_future.result()
+        if not router_future:
+            self.router_status_result = self.router_status()
+        if self.router_status_result.get("configured"):
+            if self.router_status_result.get("ssh"):
+                self.log.ok(
+                    f"Роутер {self.router_status_result.get('id', 'unknown')}: "
+                    f"OpenWrt {self.router_status_result.get('firmware', 'unknown')}, "
+                    f"IPv6 {'OK' if self.router_status_result.get('ipv6') and self.router_status_result.get('default_ipv6') else 'нет'}",
+                    event=False,
+                )
+            else:
+                self.log.error(f"Роутер недоступен — {self.router_status_result.get('error', 'SSH error')}")
+        for server, result in zip(servers, results):
+            self.phase = f"Обрабатываю результат {server['name']}…"
             self.status_results.append(result)
             self.show_status(result)
             self.refresh()
@@ -613,7 +798,7 @@ class Monitor:
         destination.mkdir(parents=True, exist_ok=True)
         archive = destination / Path(remote_path).name
         try:
-            copied = run(self.scp_base(server) + [f"{self.target(server)}:{remote_path}", str(archive)], timeout=900)
+            copied = run(self.scp_base(server) + [f"{self.target(server, scp=True)}:{remote_path}", str(archive)], timeout=900)
             if copied.returncode != 0:
                 raise RuntimeError(copied.stderr.strip() or "scp failed")
             local_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -629,6 +814,31 @@ class Monitor:
 
     def archive_root(self):
         return Path(self.config["backup_root"]) / "auto-backups"
+
+    def backup_router(self):
+        router = self.config.get("router_backup")
+        if not router:
+            raise RuntimeError("Резервирование роутера не настроено")
+        script = Path(router["script"])
+        if not script.is_file():
+            raise FileNotFoundError(f"Не найден скрипт резервирования роутера: {script}")
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            raise RuntimeError("PowerShell не найден")
+        self.phase = "Создаю полный бэкап роутера…"
+        self.refresh()
+        try:
+            result = run([
+                powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                "-RouterTarget", router["target"], "-Destination", router["destination"],
+            ], timeout=7200)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip().splitlines()
+                raise RuntimeError(detail[-1] if detail else f"PowerShell exit {result.returncode}")
+            self.log.ok("Полный бэкап роутера сохранён и проверен")
+        finally:
+            self.phase = ""
+            self.refresh()
 
     def cache_dir(self, server, component):
         return self.archive_root() / ".latest" / server["folder"] / component
@@ -679,44 +889,63 @@ class Monitor:
         if saved_any:
             self.log.info("Создаю первую общую точку восстановления из последних локальных копий")
         try:
+            items = []
             for server in self.config["servers"]:
+                fingerprints.setdefault(server["name"], {})
                 for component in server["components"]:
                     label = f"{server['name']}/{component}"
                     destination = staging / server["folder"] / component if staging else None
-                    self.phase = f"Проверяю бэкап {label}…"
                     self.backup_status[label] = {"state": "checking", "text": "Проверка…", "checked": datetime.now().strftime("%H:%M:%S")}
-                    self.refresh()
-                    try:
-                        current = self.remote_manifest(server, component)
-                        previous = fingerprints.setdefault(server["name"], {}).get(component)
-                        if baseline:
-                            fingerprints[server["name"]][component] = current
-                            self.backup_status[label] = {"state": "clean", "text": "Baseline сохранён", "fingerprint": current, "checked": datetime.now().strftime("%H:%M:%S")}
-                            self.log.ok(f"{label}: baseline {current[:12]}, скачивание не требуется", event=False)
-                            records.append({"component": label, "status": "baseline", "fingerprint": current})
-                        elif previous == current and not force:
-                            self.backup_status[label] = {"state": "clean", "text": "Без изменений", "fingerprint": current, "checked": datetime.now().strftime("%H:%M:%S")}
-                            self.log.info(f"{label}: изменений нет ({current[:12]}), пропуск", event=False)
-                            records.append({"component": label, "status": "cached", "fingerprint": current})
-                        else:
-                            reason = "ручной полный бэкап" if force else ("первый бэкап" if not previous else f"найдены изменения {previous[:8]} → {current[:8]}")
-                            self.backup_status[label] = {"state": "checking", "text": "Скачиваю…", "fingerprint": current, "checked": datetime.now().strftime("%H:%M:%S")}
-                            self.refresh()
-                            self.log.info(f"{label}: {reason}; скачиваю компонент")
-                            result = self.download_backup(server, component, destination)
-                            self.update_cache(server, component, destination)
-                            pending_fingerprints[(server["name"], component)] = result["fingerprint"]
-                            saved_any = True
-                            self.backup_status[label] = {"state": "saved", "text": f"Обновлено {format_size(result['size'])}", "fingerprint": result["fingerprint"], "checked": datetime.now().strftime("%H:%M:%S")}
-                            self.log.ok(f"{label}: скачано {format_size(result['size'])}")
-                            records.append({"component": label, "status": "downloaded", "fingerprint": result["fingerprint"], "size": result["size"]})
-                    except Exception as exc:
-                        had_error = True
-                        self.backup_status[label] = {"state": "error", "text": "Ошибка бэкапа", "checked": datetime.now().strftime("%H:%M:%S")}
-                        self.log.error(f"{label}: бэкап не выполнен — {exc}")
-                        records.append({"component": label, "status": "error", "error": str(exc)})
-                    save_json(STATE_PATH, self.state)
-                    self.refresh()
+                    items.append((server, component, destination, fingerprints[server["name"]].get(component)))
+            self.phase = "Проверяю бэкапы параллельно…"
+            self.refresh()
+
+            def backup_one(item):
+                server, component, destination, previous = item
+                label = f"{server['name']}/{component}"
+                try:
+                    current = self.remote_manifest(server, component)
+                    if baseline:
+                        return {"label": label, "server": server, "component": component, "status": "baseline", "fingerprint": current}
+                    if previous == current and not force:
+                        return {"label": label, "server": server, "component": component, "status": "cached", "fingerprint": current}
+                    result = self.download_backup(server, component, destination)
+                    self.update_cache(server, component, destination)
+                    return {"label": label, "server": server, "component": component, "status": "downloaded", "result": result}
+                except Exception as exc:
+                    return {"label": label, "server": server, "component": component, "status": "error", "error": str(exc)}
+
+            with ThreadPoolExecutor(max_workers=min(8, len(items)), thread_name_prefix="backup") as pool:
+                futures = [pool.submit(backup_one, item) for item in items]
+                results = [future.result() for future in futures]
+            for result in results:
+                label = result["label"]
+                checked = datetime.now().strftime("%H:%M:%S")
+                if result["status"] == "error":
+                    had_error = True
+                    self.backup_status[label] = {"state": "error", "text": "Ошибка бэкапа", "checked": checked}
+                    self.log.error(f"{label}: бэкап не выполнен — {result['error']}")
+                    records.append({"component": label, "status": "error", "error": result["error"]})
+                elif result["status"] == "baseline":
+                    fingerprint = result["fingerprint"]
+                    fingerprints[result["server"]["name"]][result["component"]] = fingerprint
+                    self.backup_status[label] = {"state": "clean", "text": "Baseline сохранён", "fingerprint": fingerprint, "checked": checked}
+                    self.log.ok(f"{label}: baseline {fingerprint[:12]}, скачивание не требуется", event=False)
+                    records.append({"component": label, "status": "baseline", "fingerprint": fingerprint})
+                elif result["status"] == "cached":
+                    fingerprint = result["fingerprint"]
+                    self.backup_status[label] = {"state": "clean", "text": "Без изменений", "fingerprint": fingerprint, "checked": checked}
+                    self.log.info(f"{label}: изменений нет ({fingerprint[:12]}), пропуск", event=False)
+                    records.append({"component": label, "status": "cached", "fingerprint": fingerprint})
+                else:
+                    downloaded = result["result"]
+                    fingerprint = downloaded["fingerprint"]
+                    pending_fingerprints[(result["server"]["name"], result["component"])] = fingerprint
+                    saved_any = True
+                    self.backup_status[label] = {"state": "saved", "text": f"Обновлено {format_size(downloaded['size'])}", "fingerprint": fingerprint, "checked": checked}
+                    self.log.ok(f"{label}: скачано {format_size(downloaded['size'])}")
+                    records.append({"component": label, "status": "downloaded", "fingerprint": fingerprint, "size": downloaded["size"]})
+                self.refresh()
 
             if staging and saved_any and not had_error:
                 self.phase = "Собираю полную точку восстановления…"
@@ -795,6 +1024,7 @@ class BackupGUI:
         self.status_event = threading.Event()
         self.backup_event = threading.Event()
         self.force_event = threading.Event()
+        self.router_backup_event = threading.Event()
         self.event_snapshot = None
         self.events_initialized = False
         self.last_notified_event = None
@@ -868,13 +1098,15 @@ class BackupGUI:
         controls = tk.Frame(header, bg=self.CARD_ALT)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew")
         controls.grid_columnconfigure(0, weight=1)
-        self.label(controls, textvariable=self.next_var, size=9, color=self.MUTED).grid(row=0, column=0, sticky="w", padx=16, pady=9)
+        self.label(controls, textvariable=self.next_var, size=9, color=self.MUTED).grid(row=0, column=0, rowspan=2, sticky="w", padx=16, pady=9)
         ttk.Button(controls, text="Проверить серверы", command=self.request_check).grid(row=0, column=1, padx=(6, 0), pady=7)
         ttk.Button(controls, text="Сохранить изменения", style="Primary.TButton", command=self.request_smart_backup).grid(row=0, column=2, padx=(6, 0), pady=7)
         ttk.Button(controls, text="Создать все копии", command=self.request_force).grid(row=0, column=3, padx=(6, 0), pady=7)
-        ttk.Button(controls, text="Архивы", command=lambda: os.startfile(self.monitor.archive_root())).grid(row=0, column=4, padx=(6, 0), pady=7)
-        ttk.Button(controls, text="Настройки", command=lambda: os.startfile(str(CONFIG_PATH))).grid(row=0, column=5, padx=(6, 0), pady=7)
-        ttk.Button(controls, text="В трей", style="Small.TButton", command=self.minimize_to_tray).grid(row=0, column=6, padx=(6, 16), pady=7)
+        ttk.Button(controls, text="Бэкап настроек", command=self.backup_app_settings).grid(row=1, column=1, padx=(6, 0), pady=(0, 7))
+        ttk.Button(controls, text="Полный бэкап роутера", command=self.request_router_backup).grid(row=1, column=2, padx=(6, 0), pady=(0, 7))
+        ttk.Button(controls, text="Архивы", command=lambda: os.startfile(self.monitor.archive_root())).grid(row=1, column=3, padx=(6, 0), pady=(0, 7))
+        ttk.Button(controls, text="Настройки", command=lambda: os.startfile(str(CONFIG_PATH))).grid(row=1, column=4, padx=(6, 0), pady=(0, 7))
+        ttk.Button(controls, text="В трей", style="Small.TButton", command=self.minimize_to_tray).grid(row=1, column=5, padx=(6, 16), pady=(0, 7))
 
         body_host = tk.Frame(root, bg=self.BG)
         body_host.grid(row=1, column=0, sticky="nsew")
@@ -927,6 +1159,20 @@ class BackupGUI:
                 values[key].grid(row=row_index, column=1, sticky="w", padx=(0, 14), pady=3)
             card.grid_rowconfigure(8, minsize=9)
             self.cards[server["name"]] = values
+
+        router_card = tk.Frame(self.cards_frame, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
+        router_card.grid(row=0, column=len(self.config["servers"]), sticky="nsew", padx=(6, 0))
+        router_card.grid_columnconfigure(1, weight=1)
+        self.label(router_card, "Роутер", 12, self.TEXT, True).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 2))
+        self.label(router_card, "Состояние OpenWrt и последней полной копии", 8, self.MUTED).grid(row=1, column=0, columnspan=2, sticky="w", padx=14)
+        tk.Frame(router_card, bg=self.BORDER, height=1).grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(9, 5))
+        self.router_values = {}
+        for row_index, (key, caption) in enumerate((("ssh", "SSH"), ("identity", "ID"), ("firmware", "ПРОШИВКА"), ("overlay", "OVERLAY"), ("ipv6", "IPv6"), ("backup", "БЭКАП")), start=3):
+            self.label(router_card, caption, 8, self.MUTED, True).grid(row=row_index, column=0, sticky="w", padx=(14, 10), pady=3)
+            self.router_values[key] = self.label(router_card, "Ожидание", 9, self.YELLOW)
+            self.router_values[key].grid(row=row_index, column=1, sticky="w", padx=(0, 14), pady=3)
+        router_card.grid_rowconfigure(8, minsize=9)
+        self.card_widgets.append(router_card)
 
         backups = tk.Frame(body, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
         backups.grid(row=1, column=0, sticky="ew", pady=(10, 10))
@@ -988,6 +1234,23 @@ class BackupGUI:
     def request_force(self):
         if messagebox.askyesno("Создать все копии?", "Будут заново созданы архивы всех серверов, даже если изменений нет."):
             self.force_event.set()
+            self.wake_event.set()
+
+    def backup_app_settings(self):
+        try:
+            archive = create_settings_backup()
+            self.log.ok(f"Настройки приложения сохранены: {archive.name}")
+            messagebox.showinfo("Бэкап настроек", f"Готово: {archive.name}\n\nПапка: {archive.parent}")
+        except Exception as exc:
+            self.log.error(f"Бэкап настроек приложения: {exc}")
+            messagebox.showerror("Бэкап настроек", str(exc))
+
+    def request_router_backup(self):
+        if not self.config.get("router_backup"):
+            messagebox.showinfo("Бэкап роутера", "Добавьте раздел router_backup в config.json.")
+            return
+        if messagebox.askyesno("Полный бэкап роутера?", "Будут считаны настройки, writable overlay и все MTD-разделы. На роутере ничего не изменяется."):
+            self.router_backup_event.set()
             self.wake_event.set()
 
     def copy_to_clipboard(self, text):
@@ -1118,6 +1381,8 @@ class BackupGUI:
             self.status_event.clear()
             backup = self.backup_event.is_set()
             self.backup_event.clear()
+            router_backup = self.router_backup_event.is_set()
+            self.router_backup_event.clear()
             now = time.monotonic()
             if status or force or now >= next_status:
                 try:
@@ -1133,6 +1398,11 @@ class BackupGUI:
                     self.log.error(f"Проверка бэкапов: {exc}")
                 next_backup = time.monotonic() + backup_interval
                 self.monitor.next_backup_at = next_backup
+            if router_backup:
+                try:
+                    self.monitor.backup_router()
+                except Exception as exc:
+                    self.log.error(f"Бэкап роутера: {exc}")
 
     def refresh_ui(self):
         if not self.root.winfo_exists():
@@ -1164,6 +1434,8 @@ class BackupGUI:
             self.set_status(card["xui"], "Работает" if xui_ok else "Остановлен", xui_ok)
             panel_ok = 200 <= row.get("panel", 0) < 400
             self.set_status(card["panel"], f"Доступна  ·  HTTP {row.get('panel', 0)}" if panel_ok else "Недоступна", panel_ok)
+            if row.get("panel", 0) and 200 <= row["panel"] < 400:
+                card["panel"].configure(text=f"{card['panel'].cget('text')} · {row.get('panel_transport', 'IPv4')}")
             if "site" in row["server"].get("components", []):
                 site_ok = 200 <= row.get("site", 0) < 400
                 self.set_status(card["site"], f"Доступен  ·  HTTP {row.get('site', 0)}" if site_ok else "Недоступен", site_ok)
@@ -1171,6 +1443,22 @@ class BackupGUI:
                 card["site"].configure(text="—", fg=self.MUTED)
             services = self.service_text(row.get("remote", {}).get("containers", []))
             card["services"].configure(text=services, fg=self.GREEN if services != "● Docker не используется" else self.MUTED)
+        router = self.monitor.router_status_result
+        router_backup = router.get("backup", {})
+        router_ok = router.get("ssh") is True
+        self.set_status(self.router_values["ssh"], "Доступен" if router_ok else ("Не настроен" if not router.get("configured") else "Недоступен"), router_ok)
+        identity = router.get("id", "—")
+        self.set_status(self.router_values["identity"], identity, router_ok)
+        firmware = router.get("firmware", "—")
+        firmware_text = f"{firmware} · {router.get('target', '—')}"
+        self.set_status(self.router_values["firmware"], firmware_text, router_ok)
+        overlay = router.get("overlay_used", "?")
+        overlay_ok = overlay.isdigit() and int(overlay) < 90
+        self.set_status(self.router_values["overlay"], f"Использовано {overlay}%", overlay_ok)
+        ipv6_ok = bool(router.get("ipv6")) and router.get("default_ipv6", False)
+        self.set_status(self.router_values["ipv6"], "Глобальный + маршрут" if ipv6_ok else "Нет глобального маршрута", ipv6_ok)
+        backup_ok = router_backup.get("state") == "ok"
+        self.set_status(self.router_values["backup"], router_backup.get("text", "—"), backup_ok)
         for item in self.backup_tree.get_children():
             self.backup_tree.delete(item)
         for server in self.config["servers"]:
@@ -1250,6 +1538,14 @@ def self_test():
     assert parse_json_output(sample) == {"ok": True}
     assert visible_len(paint("ONLINE", Color.GREEN)) == 6
     assert visible_len(cell("abc", 8)) == 8
+    probe = object.__new__(Monitor)
+    ipv6_server = {"user": "root", "host": "203.0.113.10", "ssh_host": "2001:db8::2"}
+    assert probe.ssh_base(ipv6_server)[-1] == "root@2001:db8::2"
+    assert "ControlMaster=no" in probe.ssh_base(ipv6_server)
+    assert "ControlMaster=no" in probe.scp_base(ipv6_server)
+    assert probe.target(ipv6_server, scp=True) == "root@[2001:db8::2]"
+    panel_server = {"panel_url": "https://203.0.113.10:35129/panel/", "ssh_host": "2001:db8::2"}
+    assert probe.panel_url6(panel_server) == "https://[2001:db8::2]:35129/panel/"
     fake = type("FakeMonitor", (), {
         "internet_state": (True, ""), "status_results": [{
             "server": {"name": "NL", "host": "127.0.0.1", "components": ["x-ui", "stack"]},
@@ -1286,6 +1582,11 @@ def self_test():
         assert checked["servers"][0]["folder"] == "203.0.113.10"
         assert checked["servers"][1]["components"] == ["x-ui", "stack", "site"]
         assert checked["servers"][1]["site_root"] == "/var/www/example.com"
+        settings_dir = Path(tmp) / "settings-backups"
+        archive = create_settings_backup(settings_dir, config_path, path)
+        with zipfile.ZipFile(archive) as bundle:
+            assert bundle.testzip() is None
+            assert set(bundle.namelist()) == {"config.json", "state.json", "metadata.json"}
         monitor = object.__new__(Monitor)
         monitor.config = {"backup_root": tmp, "retention_count": 30}
         monitor.archive_root().mkdir()

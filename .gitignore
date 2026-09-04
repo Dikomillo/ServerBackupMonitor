@@ -4,6 +4,7 @@ config.json
 state.json
 logs/
 backups/
+settings-backups/
 .repowise
 
 # Python and editor files
